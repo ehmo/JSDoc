@@ -190,14 +190,14 @@
   function sprm(b, code, operand) { b.push(code & 0xFF, (code >> 8) & 0xFF); for (var i = 0; i < operand.length; i++) b.push(operand[i] & 0xFF); }
   function chpxGrpprl(r, ftc) {
     var b = [];
-    if (r.b) sprm(b, 0x0835, [1]);            // sprmCFBold
-    if (r.i) sprm(b, 0x0836, [1]);            // sprmCFItalic
-    if (r.strike) sprm(b, 0x0837, [1]);       // sprmCFStrike
-    if (r.smallCaps) sprm(b, 0x083A, [1]);    // sprmCFSmallCaps
-    if (r.caps) sprm(b, 0x083B, [1]);         // sprmCFCaps (all caps)
-    if (r.hidden) sprm(b, 0x083C, [1]);       // sprmCFVanish (hidden text)
-    if (r.dstrike) sprm(b, 0x2A53, [1]);      // sprmCFDStrike (double strikethrough)
-    if (r.u) sprm(b, 0x2A3E, [WR_UL[r.uStyle] || 1]);  // sprmCKul (1 single, 3 double, 4 dotted, 7 dash, 11 wave)
+    if (r.b != null) sprm(b, 0x0835, [r.b ? 1 : 0]);            // sprmCFBold
+    if (r.i != null) sprm(b, 0x0836, [r.i ? 1 : 0]);            // sprmCFItalic
+    if (r.strike != null) sprm(b, 0x0837, [r.strike ? 1 : 0]);  // sprmCFStrike
+    if (r.smallCaps != null) sprm(b, 0x083A, [r.smallCaps ? 1 : 0]); // sprmCFSmallCaps
+    if (r.caps != null) sprm(b, 0x083B, [r.caps ? 1 : 0]);      // sprmCFCaps (all caps)
+    if (r.hidden != null) sprm(b, 0x083C, [r.hidden ? 1 : 0]);  // sprmCFVanish (hidden text)
+    if (r.dstrike != null) sprm(b, 0x2A53, [r.dstrike ? 1 : 0]); // sprmCFDStrike (double strikethrough)
+    if (r.u != null) sprm(b, 0x2A3E, [r.u ? (WR_UL[r.uStyle] || 1) : 0]); // sprmCKul
     if (r.va === 'super') sprm(b, 0x2A48, [1]);          // sprmCSs = 1 (superscript)
     else if (r.va === 'sub') sprm(b, 0x2A48, [2]);       // sprmCSs = 2 (subscript)
     if (r.size) { var hp = Math.round(r.size * 2); sprm(b, 0x4A43, [hp, hp >> 8]); }      // sprmCHps (half-points)
@@ -407,14 +407,18 @@
     if (r.endRef != null) return { endRef: r.endRef };   // endnote-reference anchor (no text)
     if (r.comRef != null) return { comRef: r.comRef };   // comment-reference anchor (no text)
     if (r.tbxRef != null) return { tbxRef: r.tbxRef };   // text-box (drawn-object) anchor (no text)
-    var n = { text: String(r.text == null ? '' : r.text), b: !!r.b, i: !!r.i, u: !!r.u, strike: !!r.strike, size: r.size || null, font: r.font || null, color: r.color == null ? null : r.color };
+    var n = { text: String(r.text == null ? '' : r.text),
+      b: r.b == null ? null : !!r.b, i: r.i == null ? null : !!r.i,
+      u: r.u == null ? null : !!r.u, strike: r.strike == null ? null : !!r.strike,
+      size: r.size == null ? null : r.size, font: r.font || null,
+      color: r.color == null ? null : r.color };
     if (r.va === 'super' || r.va === 'sub') n.va = r.va;   // vertical alignment (super/subscript)
     if (r.highlight != null) n.highlight = r.highlight;    // highlight fill (COLORREF)
     if (r.uStyle) n.uStyle = r.uStyle;                     // underline style (double/dotted/dashed/wavy)
-    if (r.smallCaps) n.smallCaps = true;                   // small caps
-    if (r.caps) n.caps = true;                             // all caps
-    if (r.hidden) n.hidden = true;                         // hidden text
-    if (r.dstrike) n.dstrike = true;                       // double strikethrough
+    if (r.smallCaps != null) n.smallCaps = !!r.smallCaps;  // small caps
+    if (r.caps != null) n.caps = !!r.caps;                 // all caps
+    if (r.hidden != null) n.hidden = !!r.hidden;            // hidden text
+    if (r.dstrike != null) n.dstrike = !!r.dstrike;        // double strikethrough
     if (r.spacing) n.spacing = r.spacing;                  // character spacing (pt; + expanded, - condensed)
     if (r.position) n.position = r.position;               // character position (pt; + raised, - lowered)
     if (r.url) n.url = String(r.url);

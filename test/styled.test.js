@@ -468,6 +468,10 @@ var styledParagraph = docToText.model(textToDoc([
   { runs: [{ text: 'Styled heading' }], kind: 'p', style: 'Heading 1', ilfo: 0x07FF }
 ])).body[0];
 check('paragraph style survives as inherited formatting without a list marker', styledParagraph.runs.some(function (r) { return r.text === 'Styled heading' && r.b === true && r.size === 18; }) && !styledParagraph.list);
+var unboldHeading = docToText.model(textToDoc([
+  { runs: [{ text: 'Plain heading', b: false, i: false }], kind: 'p', style: 'Heading 1', ilfo: 0x07FF }
+])).body[0].runs[0];
+check('explicit false run formatting overrides a paragraph style', unboldHeading.text === 'Plain heading' && unboldHeading.b === false && unboldHeading.i === false);
 check('an unknown paragraph style refuses instead of silently using Normal', (function () {
   try { textToDoc([{ runs: [{ text: 'X' }], kind: 'p', style: 'Missing style' }]); return false; }
   catch (error) { return /paragraph style/.test(error.message); }
