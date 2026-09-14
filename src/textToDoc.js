@@ -20,7 +20,8 @@
  * font as CHPX sprms — fonts the skeleton lacks are appended to its SttbfFfn),
  * tables (cell marks + sprmPFInTable / sprmPFTtp / sprmTDefTable with borders),
  * and inline images (PNG/JPEG as an OfficeArt picture in a Data stream, sized +
- * placed). Not yet: paragraph spacing/indentation, hyperlink URLs.
+ * placed), paragraph spacing/indentation and tab stops, named paragraph styles,
+ * and hyperlink URLs. Not yet: multiple sections or floating image placement.
  *
  * Verification: round-tripped through docToText (.model re-reads the table
  * cells) AND the independent word-extractor (test/styled.test.js / writer.test.js),
