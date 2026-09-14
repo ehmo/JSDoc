@@ -946,9 +946,10 @@
     setPair(74, lfoTblOff, listTbls.lfo.length); // PlfLfo (list format overrides)
 
     // Page setup: rebuild the first section's SEPX from input.page. Margins
-    // (sprmSDyaTop 0x9023 / Bottom 0x9024 / sprmSDxaLeft 0xB021 / Right 0xB022) and
+    // (sprmSDyaTop 0x9023 / Bottom 0x9024 / sprmSDxaLeft 0xB021 / Right 0xB022),
+    // header/footer offsets (sprmSDyaHdrTop 0xB017 / sprmSDyaHdrBottom 0xB018), and
     // page size (sprmSXaPage 0xB01F / sprmSYaPage 0xB020) are patched in the
-    // skeleton's grpprl; orientation (sprmSBOrientation 0x301D) and column count
+    // skeleton's grpprl. Orientation (sprmSBOrientation 0x301D) and column count
     // (sprmSCcolumns 0x500B) are appended since the skeleton lacks them. The grown
     // SEPX no longer fits in place, so it's relocated to the end of the WordDocument
     // and the SED.fcSepx repointed. All twips.
@@ -958,7 +959,8 @@
       if (sepx > 0 && sepx + 2 < newWd.length) {
         var ocb = newWd[sepx] | (newWd[sepx + 1] << 8), grp = [];
         for (var gi = 0; gi < ocb && sepx + 2 + gi < newWd.length; gi++) grp.push(newWd[sepx + 2 + gi]);
-        var pmap = { 0x9023: pg.top, 0x9024: pg.bottom, 0xB021: pg.left, 0xB022: pg.right, 0xB01F: pg.width, 0xB020: pg.height };
+        var pmap = { 0x9023: pg.top, 0x9024: pg.bottom, 0xB021: pg.left, 0xB022: pg.right,
+          0xB017: pg.header, 0xB018: pg.footer, 0xB01F: pg.width, 0xB020: pg.height };
         var sg = 0, present = {};
         while (sg + 2 <= grp.length) {
           var ss = grp[sg] | (grp[sg + 1] << 8), ssa = (ss >> 13) & 7;
