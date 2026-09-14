@@ -461,6 +461,18 @@ var numDoc = textToDoc([
 check('numbered list round-trips with 1. 2. 3.', /(^|\n)1\. A\n2\. B\n3\. C(\n|$)/.test(docToText(numDoc)));
 check('numbered markers on the model', docToText.model(numDoc).body.filter(function (p) { return p.list; }).map(function (p) { return p.list.marker; }).join(' ') === '1. 2. 3.');
 
+// 11d) Paragraph styles: a writer paragraph may select a skeleton paragraph style
+// by name. A direct not-in-list sentinel prevents a heading style's list defaults
+// from manufacturing a marker, without binding callers to its istd.
+var styledParagraph = docToText.model(textToDoc([
+  { runs: [{ text: 'Styled heading' }], kind: 'p', style: 'Heading 1', ilfo: 0x07FF }
+])).body[0];
+check('paragraph style survives as inherited formatting without a list marker', styledParagraph.runs.some(function (r) { return r.text === 'Styled heading' && r.b === true && r.size === 18; }) && !styledParagraph.list);
+check('an unknown paragraph style refuses instead of silently using Normal', (function () {
+  try { textToDoc([{ runs: [{ text: 'X' }], kind: 'p', style: 'Missing style' }]); return false; }
+  catch (error) { return /paragraph style/.test(error.message); }
+})());
+
 // 11c) Advanced character formatting: double strikethrough (sprmCFDStrike), character
 // spacing (sprmCDxaSpace, expanded/condensed) and position (sprmCHpsPos, raised/lowered),
 // including negative values.

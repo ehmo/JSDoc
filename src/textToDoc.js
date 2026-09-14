@@ -229,6 +229,27 @@
     // trailing slack within lcb, which would desync the sequential read).
     return { names: names, cData: cData, cDataOff: cDataOff - fc, used: p - fc, bytes: tbl.slice(fc, fc + lcb) };
   }
+  // Paragraph style names from the skeleton's STSH. A caller can name a
+  // built-in paragraph style without depending on its template-specific istd.
+  function readParagraphStyles(tbl, fc, lcb) {
+    var out = {}, dvT = new DataView(tbl.buffer, tbl.byteOffset, tbl.byteLength), end = fc + lcb;
+    if (lcb < 6 || fc < 0 || end > tbl.length) return out;
+    var cbStshi = dvT.getUint16(fc, true), stshi = fc + 2;
+    if (stshi + cbStshi > end || cbStshi < 4) return out;
+    var count = dvT.getUint16(stshi, true), cbBase = dvT.getUint16(stshi + 2, true), p = stshi + cbStshi;
+    for (var i = 0; i < count && p + 2 <= end; i++) {
+      var cbStd = dvT.getUint16(p, true); p += 2;
+      if (!cbStd) continue;
+      var std = p; p += cbStd;
+      if (p > end || cbBase < 6 || std + cbBase + 2 > p) break;
+      if ((dvT.getUint16(std + 2, true) & 0xF) !== 1) continue;
+      var nameAt = std + cbBase, cch = dvT.getUint16(nameAt, true), name = '';
+      if (nameAt + 2 + cch * 2 + 2 > p) continue;
+      for (var q = 0; q < cch; q++) name += String.fromCharCode(dvT.getUint16(nameAt + 2 + q * 2, true));
+      if (name) out[name.toLowerCase()] = i;
+    }
+    return out;
+  }
   // Build one FFN: cbFfnM1, flags (fTrueType), wWeight, then the UTF-16 name+NUL.
   function buildFfn(name) {
     name = name.slice(0, 100);
@@ -274,8 +295,8 @@
 
   // A PapxInFkp (cb=0 form): [0][cb'][GrpPrlAndIstd], where GrpPrlAndIstd is
   // istd (2 bytes, 0 = Normal) + grpprl, zero-padded to 2*cb' bytes.
-  function papxInFkp(grpprl) {
-    var body = [0, 0].concat(grpprl), cbq = Math.ceil(body.length / 2);
+  function papxInFkp(grpprl, istd) {
+    var style = istd == null ? 0 : (istd & 0x0FFF), body = [style & 0xFF, (style >> 8) & 0xFF].concat(grpprl), cbq = Math.ceil(body.length / 2);
     var u = new Uint8Array(2 + cbq * 2); u[1] = cbq;
     for (var i = 0; i < body.length; i++) u[2 + i] = body[i] & 0xFF;
     return u;
@@ -403,7 +424,7 @@
   // the skeleton's built-in LFOs: bullet -> ilfo 2, number -> ilfo 1.
   function mapPara(p) {
     var li = p.list, ilfo = li ? (li.kind === 'number' ? 1 : 2) : (p.ilfo || 0), ilvl = li ? (li.ilvl || 0) : (p.ilvl || 0);
-    var m = { runs: (p.runs || []).map(normRun), kind: p.kind || 'p', align: p.align || 0, ilfo: ilfo, ilvl: ilvl, pp: p.pp || null };
+    var m = { runs: (p.runs || []).map(normRun), kind: p.kind || 'p', align: p.align || 0, ilfo: ilfo, ilvl: ilvl, pp: p.pp || null, style: p.style == null ? null : p.style };
     if (p.tblw) m.tblw = p.tblw;   // preserved table column boundaries (rgdxaCenter) on a rowEnd
     if (p.hmerge) m.hmerge = p.hmerge;   // 'start' | 'cont' — horizontal cell merge
     if (p.vmerge) m.vmerge = p.vmerge;   // 'restart' | 'cont' — vertical cell merge
@@ -487,6 +508,15 @@
     var fcLcbStart = rgLwStart + cslw * 4 + 2;
     function pairFc(i) { return dv.getUint32(fcLcbStart + i * 8, true); }
     function pairLcb(i) { return dv.getUint32(fcLcbStart + i * 8 + 4, true); }
+    var styleFc = pairFc(1), styleLcb = pairLcb(1);
+    var paragraphStyles = readParagraphStyles(tbl, styleFc, styleLcb);
+    function styleIndex(value) {
+      if (value == null || value === '') return 0;
+      if (typeof value === 'number' && value >= 0 && value <= 0x0FFF && value === Math.floor(value)) return value;
+      var found = typeof value === 'string' ? paragraphStyles[value.toLowerCase()] : null;
+      if (found == null) throw new Error('paragraph style is not present in the template');
+      return found;
+    }
 
     var T = (wd.length + 1) & ~1;                  // text offset in WordDocument (even)
     function fcAt(charIdx) { return T + charIdx * 2; }
@@ -499,7 +529,7 @@
     // sprmPIlfo 0x460B, referencing the skeleton's list tables) and alignment
     // (sprmPJc80 0x2403: 0 left / 1 centre / 2 right / 3 justify).
     function papxForP(par) {
-      var g = [];
+      var g = [], istd = styleIndex(par.style);
       if (par.ilfo) { g.push(0x0A, 0x26, par.ilvl & 0xFF); g.push(0x0B, 0x46, par.ilfo & 0xFF, (par.ilfo >> 8) & 0xFF); }
       if (par.align) g.push(0x03, 0x24, par.align & 0xFF);
       // Spacing/indentation (twips): each sprm carries a signed 16-bit operand
@@ -535,7 +565,7 @@
           });
         }
       }
-      return g.length ? papxInFkp(g) : PNORMAL;
+      return g.length || istd ? papxInFkp(g, istd) : PNORMAL;
     }
 
     // Font table: reuse the skeleton's fonts, append any the model introduces,
