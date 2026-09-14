@@ -33,7 +33,7 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  var SECTOR = 512, FREESECT = 0xFFFFFFFF, ENDOFCHAIN = 0xFFFFFFFE, FATSECT = 0xFFFFFFFD;
+  var SECTOR = 512, FREESECT = 0xFFFFFFFF, ENDOFCHAIN = 0xFFFFFFFE, FATSECT = 0xFFFFFFFD, DIFSECT = 0xFFFFFFFC;
 
   function u16(b, o, v) { b[o] = v & 0xFF; b[o + 1] = (v >> 8) & 0xFF; }
   function u32(b, o, v) { b[o] = v & 0xFF; b[o + 1] = (v >> 8) & 0xFF; b[o + 2] = (v >> 16) & 0xFF; b[o + 3] = (v >>> 24) & 0xFF; }
@@ -61,11 +61,27 @@
     var nFat = dv.getUint32(44, true), dirStart = dv.getUint32(48, true);
     var miniCutoff = dv.getUint32(56, true), miniFatStart = dv.getUint32(60, true);
     function sectorOff(s) { return SECTOR + s * ssz; }
-    // DIFAT -> FAT sector list (109 in header; deeper DIFAT unsupported but rare for our files)
+    // DIFAT -> FAT sector list (109 header slots, followed by continuation sectors).
     var fatSecs = [];
     for (var i = 0; i < 109 && fatSecs.length < nFat; i++) { var s = dv.getUint32(76 + i * 4, true); if (s !== FREESECT && s !== ENDOFCHAIN) fatSecs.push(s); }
+    var difat = dv.getUint32(68, true), nDifat = dv.getUint32(72, true), difatEntries = ssz / 4 - 1;
+    for (var di = 0; di < nDifat && fatSecs.length < nFat; di++) {
+      if (difat === FREESECT || difat === ENDOFCHAIN) return null;
+      var difatOffset = sectorOff(difat);
+      if (difatOffset + ssz > b.length) return null;
+      for (var de = 0; de < difatEntries && fatSecs.length < nFat; de++) {
+        var fatSector = dv.getUint32(difatOffset + de * 4, true);
+        if (fatSector !== FREESECT && fatSector !== ENDOFCHAIN) fatSecs.push(fatSector);
+      }
+      difat = dv.getUint32(difatOffset + difatEntries * 4, true);
+    }
+    if (fatSecs.length !== nFat) return null;
     var fat = new Uint32Array(fatSecs.length * (ssz / 4));
-    for (i = 0; i < fatSecs.length; i++) for (var j = 0; j < ssz / 4; j++) fat[i * (ssz / 4) + j] = dv.getUint32(sectorOff(fatSecs[i]) + j * 4, true);
+    for (i = 0; i < fatSecs.length; i++) {
+      var fatOffset = sectorOff(fatSecs[i]);
+      if (fatOffset + ssz > b.length) return null;
+      for (var j = 0; j < ssz / 4; j++) fat[i * (ssz / 4) + j] = dv.getUint32(fatOffset + j * 4, true);
+    }
     function chain(start, fatTable) { var out = [], s = start, guard = 0; while (s !== ENDOFCHAIN && s !== FREESECT && guard++ < 1e6) { out.push(s); s = fatTable[s]; } return out; }
     function readRegular(start, size) {
       var secs = chain(start, fat), out = new Uint8Array(secs.length * ssz);
@@ -104,19 +120,20 @@
   }
 
   // ---- [MS-CFB] writer (streams padded >= 4096 -> regular FAT only) --------
-  function writeHeader(b, fatSectors, dirStart) {
+  function writeHeader(b, fatSectors, difatSectors, dirStart) {
     var sig = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
     for (var i = 0; i < 8; i++) b[i] = sig[i];
     u16(b, 24, 0x003E); u16(b, 26, 0x0003); u16(b, 28, 0xFFFE); u16(b, 30, 0x0009); u16(b, 32, 0x0006);
     u32(b, 44, fatSectors); u32(b, 48, dirStart); u32(b, 56, 0x00001000);
-    u32(b, 60, ENDOFCHAIN); u32(b, 64, 0); u32(b, 68, ENDOFCHAIN); u32(b, 72, 0);
+    u32(b, 60, ENDOFCHAIN); u32(b, 64, 0);
+    u32(b, 68, difatSectors ? fatSectors : ENDOFCHAIN); u32(b, 72, difatSectors);
     for (var d = 0; d < 109; d++) u32(b, 76 + d * 4, d < fatSectors ? d : FREESECT);
   }
   function writeDir(b, idx, name, type, start, size, left, right, child) {
     var o = idx * 128, n;
     for (n = 0; n < name.length && n < 31; n++) u16(b, o + n * 2, name.charCodeAt(n));
     u16(b, o + 0x40, name.length ? (name.length + 1) * 2 : 0);
-    b[o + 0x42] = type; b[o + 0x43] = 1;
+    b[o + 0x42] = type; b[o + 0x43] = type === 0 ? 0 : 1;
     u32(b, o + 0x44, left < 0 ? FREESECT : left);
     u32(b, o + 0x48, right < 0 ? FREESECT : right);
     u32(b, o + 0x4C, child < 0 ? FREESECT : child);
@@ -133,12 +150,20 @@
     pad.sort(function (a, b) { var an = a.name.toUpperCase(), bn = b.name.toUpperCase(); return an.length - bn.length || (an < bn ? -1 : an > bn ? 1 : 0); });
     var dirSectors = Math.ceil((1 + pad.length) / 4);
     var nonFat = dirSectors + pad.reduce(function (a, s) { return a + s.sectors; }, 0);
-    var fatSectors = 1; while (Math.ceil((nonFat + fatSectors) / 128) > fatSectors) fatSectors++;
-    var total = fatSectors + nonFat, dirStart = fatSectors, p = dirStart + dirSectors;
+    // FAT must also allocate its own sectors and the DIFAT continuation sectors.
+    var fatSectors = 1, difatSectors = 0;
+    while (true) {
+      difatSectors = Math.ceil(Math.max(0, fatSectors - 109) / 127);
+      var requiredFat = Math.ceil((nonFat + fatSectors + difatSectors) / 128);
+      if (requiredFat <= fatSectors) break;
+      fatSectors = requiredFat;
+    }
+    var total = fatSectors + difatSectors + nonFat, dirStart = fatSectors + difatSectors, p = dirStart + dirSectors;
     pad.forEach(function (s) { s.start = p; p += s.sectors; });
     var fat = new Uint8Array(fatSectors * SECTOR);
     for (var i = 0; i < fatSectors * 128; i++) u32(fat, i * 4, FREESECT);
     for (i = 0; i < fatSectors; i++) u32(fat, i * 4, FATSECT);
+    for (i = 0; i < difatSectors; i++) u32(fat, (fatSectors + i) * 4, DIFSECT);
     for (i = 0; i < dirSectors; i++) u32(fat, (dirStart + i) * 4, i < dirSectors - 1 ? dirStart + i + 1 : ENDOFCHAIN);
     pad.forEach(function (s) { for (var k = 0; k < s.sectors; k++) u32(fat, (s.start + k) * 4, k < s.sectors - 1 ? s.start + k + 1 : ENDOFCHAIN); });
     var dir = new Uint8Array(dirSectors * SECTOR);
@@ -146,8 +171,16 @@
     pad.forEach(function (s, idx) { writeDir(dir, idx + 1, s.name, 2, s.start, s.size, -1, idx < pad.length - 1 ? idx + 2 : -1, -1); });
     for (var e = 1 + pad.length; e < dirSectors * 4; e++) writeDir(dir, e, '', 0, 0, 0, -1, -1, -1);
     var file = new Uint8Array(SECTOR * (1 + total));
-    writeHeader(file, fatSectors, dirStart);
+    writeHeader(file, fatSectors, difatSectors, dirStart);
     file.set(fat, SECTOR); file.set(dir, SECTOR + dirStart * SECTOR);
+    for (i = 0; i < difatSectors; i++) {
+      var difatOffset = SECTOR + (fatSectors + i) * SECTOR;
+      for (var j = 0; j < 127; j++) {
+        var fatIndex = 109 + i * 127 + j;
+        u32(file, difatOffset + j * 4, fatIndex < fatSectors ? fatIndex : FREESECT);
+      }
+      u32(file, difatOffset + 508, i + 1 < difatSectors ? fatSectors + i + 1 : ENDOFCHAIN);
+    }
     pad.forEach(function (s) { file.set(s.data, SECTOR + s.start * SECTOR); });
     return file;
   }
@@ -686,6 +719,10 @@
     var chpx = placePages(chpxRuns.map(function (r) { return { fc0: fcAt(r.s), fc1: fcAt(r.e), blob: r.blob }; }), 1);
     var papx = placePages(papxParas.map(function (p) { return { fc0: fcAt(p.s), fc1: fcAt(p.e), blob: p.blob }; }), 13);
     var newWd = concat(parts, totalLen);
+    // Keep FibBase text bounds consistent with the replacement text plane.
+    // Strict readers use these before following the piece table.
+    u32(newWd, 24, T);                              // fcMin
+    u32(newWd, 28, T + textBytes);                  // fcMac
     u32(newWd, rgLwStart + 3 * 4, ccpText);        // ccpText (body only)
     u32(newWd, rgLwStart + 4 * 4, ccpFtn);         // ccpFtn (footnote document)
     u32(newWd, rgLwStart + 5 * 4, ccpHdd);         // ccpHdd (header document)

@@ -74,6 +74,25 @@
     }
   }
 
+  // Parse only caller-owned logical streams. The host can use a stricter CFB
+  // reader and omit unrelated streams before this parser sees document data.
+  function parseStreams(input) {
+    try {
+      if (!input || typeof input !== 'object') return null;
+      var names = ['WordDocument', '0Table', '1Table', 'Data', '\x05SummaryInformation'];
+      var byName = {};
+      for (var i = 0; i < names.length; i++) {
+        var bytes = toUint8(input[names[i]]);
+        if (bytes) byName[names[i]] = { bytes: bytes };
+      }
+      if (!byName.WordDocument) return null;
+      var cfb = { byName: byName, getStream: function (entry) { return entry.bytes; } };
+      return parseWord(byName.WordDocument.bytes, cfb);
+    } catch (e) {
+      return null;
+    }
+  }
+
   // docToText(input) -> main-body text, or null (unchanged, back-compatible).
   function docToText(input) {
     var doc = parse(input);
@@ -93,6 +112,7 @@
   // table cells and \n at row/paragraph breaks. Or null on failure.
   docToText.html = function (input) { var doc = parse(input); return doc ? doc.html : null; };
   docToText.model = function (input) { var doc = parse(input); return doc ? doc.model : null; };
+  docToText.modelFromStreams = function (input) { var doc = parseStreams(input); return doc ? doc.model : null; };
   // Internal list-marker helpers, exposed for unit tests (the numbered path isn't
   // reachable through the bullet-only writer skeleton). Not part of the public API.
   docToText._lists = { fmtNum: fmtNum, makeNumberer: makeListNumberer };
@@ -313,6 +333,19 @@
   function parseWord(wd, cfb) {
     if (wd.length < 0x20) return null;
     var dv = new DataView(wd.buffer, wd.byteOffset, wd.byteLength);
+    var diagnostics = createDiagnostics();
+    function finishDiagnostics() {
+      function group(value) {
+        return Object.keys(value).sort().map(function (code) {
+          return { code: code, count: value[code] };
+        });
+      }
+      return { unsupportedSprms: {
+        character: group(diagnostics.character),
+        paragraph: group(diagnostics.paragraph),
+        section: group(diagnostics.section)
+      }, trackedChanges: diagnostics.trackedChanges };
+    }
 
     // FibBase
     if (dv.getUint16(0, true) !== 0xA5EC) return null;   // wIdent
@@ -368,22 +401,33 @@
 
     // Character runs (formatting + tracked-deletion flag). Deletions are
     // dropped from every story; the formatting feeds the styled HTML output.
-    var chpx = parseChpx(wd, tableBytes, fibRgFcLcbStart, dv);
+    var chpx = parseChpx(wd, tableBytes, fibRgFcLcbStart, dv, diagnostics);
     var isDeleted = makeIsDeleted(chpx);
     var fonts = parseFonts(tableBytes, fibRgFcLcbStart, dv);
     var styles = parseStsh(tableBytes, fibRgFcLcbStart, dv);
-    var papx = parsePapx(wd, tableBytes, fibRgFcLcbStart, dv);
+    var papx = parsePapx(wd, tableBytes, fibRgFcLcbStart, dv, diagnostics);
     // resolve(fc): the fully-resolved character props at a WordDocument offset,
     // layered lowest-to-highest priority ([MS-DOC] 2.4.6.2): paragraph style ->
     // character style (sprmCIstd) -> direct run props -> font name.
     var styleChp = styles ? styles.chp : null;            // resolved character props per istd
+    var usedStyleDiagnostics = {};
+    function useStyleDiagnostics(istd) {
+      if (!styles || !styles.diagnostics || istd == null || istd < 0 || istd >= styles.diagnostics.length || usedStyleDiagnostics[istd]) return;
+      usedStyleDiagnostics[istd] = 1;
+      if (styles.bases && styles.bases[istd] !== 0x0FFF) useStyleDiagnostics(styles.bases[istd]);
+      mergeDiagnostics(diagnostics, styles.diagnostics[istd]);
+    }
     var resolve = chpx ? function (fc) {
       var out = {}, k, s;
-      if (styleChp && papx) { var pr = runAt(papx, fc); if (pr && styleChp[pr.istd]) { s = styleChp[pr.istd]; for (k in s) out[k] = s[k]; } }
+      if (styleChp && papx) { var pr = runAt(papx, fc); if (pr) useStyleDiagnostics(pr.istd); if (pr && styleChp[pr.istd]) { s = styleChp[pr.istd]; for (k in s) out[k] = s[k]; } }
       var r = runAt(chpx, fc), p = r ? r.p : {};
+      if (p.istd != null) useStyleDiagnostics(p.istd);
       if (styleChp && p.istd != null && styleChp[p.istd]) { s = styleChp[p.istd]; for (k in s) out[k] = s[k]; }
       for (k in p) if (k !== 'istd') out[k] = p[k];     // direct run props win
       if (fonts && out.ftc != null && fonts[out.ftc]) out.font = fonts[out.ftc];
+      if (fonts && out.ftc1 != null && fonts[out.ftc1]) out.fontEastAsia = fonts[out.ftc1];
+      if (fonts && out.ftc2 != null && fonts[out.ftc2]) out.fontHighAnsi = fonts[out.ftc2];
+      if (fonts && out.ftcBi != null && fonts[out.ftcBi]) out.fontComplexScript = fonts[out.ftcBi];
       // An explicit RGB (sprmCCv) wins; otherwise fall back to the 16-colour
       // palette index (sprmCIco) so both the styled HTML and the model see it.
       if ((out.cv == null || (out.cv & 0xFFFFFF) === 0) && out.ico >= 2 && out.ico <= 16 && ICO_CV[out.ico]) out.cv = ICO_CV[out.ico];
@@ -403,14 +447,31 @@
     var imgCtr = { n: 0 };
     var dataEntry = cfb.byName['Data'], dataStream = null;
     try { dataStream = dataEntry ? cfb.getStream(dataEntry) : null; } catch (e) { }
-    function paraAlign(fc) { var r = papx ? runAt(papx, fc) : null; return r ? (r.jc || 0) : 0; }
-    var listInfo = parseListDefs(tableBytes, fibRgFcLcbStart, dv);
+    function paraAlign(fc) { var r = resolvedPap(fc); return r ? (r.jc || 0) : 0; }
+    var listInfo = parseListDefs(tableBytes, fibRgFcLcbStart, dv, fonts, diagnostics);
     var listKind = listInfo ? listInfo.kind : null, listDefs = listInfo ? listInfo.defs : null;
+    if (listDefs) doc.model.lists = Object.keys(listDefs).map(function (ilfo) {
+      return { ilfo: Number(ilfo), levels: listDefs[ilfo].map(function (level) {
+        var result = { nfc: level.nfc, startAt: level.startAt, tmpl: level.tmpl.slice() };
+        if (level.markerStyle) { result.markerStyle = {}; for (var key in level.markerStyle) result.markerStyle[key] = level.markerStyle[key]; }
+        if (level.paragraphStyle) { result.paragraphStyle = {}; for (var pkey in level.paragraphStyle) result.paragraphStyle[pkey] = level.paragraphStyle[pkey]; }
+        return result;
+      }) };
+    });
     var footnoteRefCps = parseRefCps(tableBytes, fibRgFcLcbStart, dv, 2); // PlcffndRef #2 -> { bodyCp: footnoteIndex }
     var endnoteRefCps = parseRefCps(tableBytes, fibRgFcLcbStart, dv, 46); // PlcfendRef #46 -> { bodyCp: endnoteIndex }
     var commentRefCps = parseRefCps(tableBytes, fibRgFcLcbStart, dv, 4, 30); // PlcfandRef #4 (ATRD=30) -> { bodyCp: commentIndex }
     var textboxRefCps = parseRefCps(tableBytes, fibRgFcLcbStart, dv, 40, 26); // PlcfspaMom #40 (FSPA=26) -> { bodyCp: shapeIndex }
     var stylePap = styles ? styles.pap : null;          // resolved paragraph props per istd
+    function resolvedPap(fc) {
+      var direct = papx ? runAt(papx, fc) : null; if (!direct) return null;
+      useStyleDiagnostics(direct.istd);
+      var out = {}, inherited = stylePap && direct.istd != null ? stylePap[direct.istd] : null, key;
+      if (inherited) for (key in inherited) out[key] = inherited[key];
+      for (key in direct) out[key] = direct[key];
+      out._direct = direct;
+      return out;
+    }
     // A paragraph is a list item when it has a direct sprmPIlfo, OR — when it has
     // none — when its paragraph style supplies one. Word's built-in numbered
     // headings (and many real docs) carry the ilfo/ilvl in the linked style's
@@ -418,20 +479,16 @@
     // A style ilfo counts only within the valid LFO range [1, 0x07FE]; 0x07FF and
     // up are "not really in a list" sentinels Word writes into some built-in styles.
     function paraList(fc) {
-      var r = papx ? runAt(papx, fc) : null; if (!r) return null;
+      var r = resolvedPap(fc); if (!r) return null;
       var ilfo = r.ilfo, ilvl = (r.ilvl != null) ? r.ilvl : 0;
-      if (ilfo == null && stylePap && r.istd != null) {                  // no direct sprmPIlfo -> inherit list membership from the style
-        var sp = stylePap[r.istd];
-        if (sp && sp.ilfo >= 1 && sp.ilfo <= 0x07FE) { ilfo = sp.ilfo; if (r.ilvl == null) ilvl = sp.ilvl || 0; }
-      }
-      if (!ilfo) return null;
+      if (!ilfo || ilfo > 0x07FE) return null;
       return { ilvl: ilvl, ilfo: ilfo, kind: (listKind && listKind[ilfo]) || 'bullet' };
     }
     // Paragraph spacing/indentation (twips): left/right/first-line indent, space
     // before/after, and line spacing (LSPD: line + lineMult flag). Only non-zero
     // values are returned, so an unspaced paragraph stays a bare model node.
     function paraPP(fc) {
-      var r = papx ? runAt(papx, fc) : null; if (!r) return null;
+      var r = resolvedPap(fc); if (!r) return null;
       var pp = {};
       if (r.indL) pp.indL = r.indL;
       if (r.indR) pp.indR = r.indR;
@@ -439,19 +496,27 @@
       if (r.spB) pp.spB = r.spB;
       if (r.spA) pp.spA = r.spA;
       if (r.line) { pp.line = r.line; pp.lineMult = r.lineMult || 0; }
-      if (r.keepN) pp.keepNext = 1;       // keep with next paragraph
-      if (r.keepL) pp.keepLines = 1;      // keep lines together
-      if (r.pgBrk) pp.pageBreak = 1;      // page break before
+      function explicit(name) { return r[name] || r._direct && Object.prototype.hasOwnProperty.call(r._direct, name); }
+      if (explicit('keepN')) pp.keepNext = r.keepN ? 1 : 0;
+      if (explicit('keepL')) pp.keepLines = r.keepL ? 1 : 0;
+      if (explicit('pgBrk')) pp.pageBreak = r.pgBrk ? 1 : 0;
+      if (explicit('widow')) pp.widowControl = !!r.widow;
+      if (explicit('contextual')) pp.contextualSpacing = !!r.contextual;
+      if (explicit('bidi')) pp.bidi = !!r.bidi;
+      if (explicit('noAutoHyph')) pp.noAutoHyphens = !!r.noAutoHyph;
+      if (r.outlineLevel != null && (r.outlineLevel < 9 || explicit('outlineLevel'))) pp.outlineLevel = r.outlineLevel;
+      if (explicit('suppressLineNumbers')) pp.suppressLineNumbers = !!r.suppressLineNumbers;
       if (r.tabs) pp.tabs = r.tabs;       // tab stops [{ pos (twips), align, leader }]
       if (r.pShd != null) pp.shd = r.pShd; // paragraph background fill (COLORREF)
       if (r.pBrc) pp.borders = r.pBrc;    // box borders { top/left/bottom/right: { color, width (pt), type } }
+      if (r.itap || r.inTable) pp.tableDepth = r.itap || 1;
       return Object.keys(pp).length ? pp : null;
     }
-    function paraIsTtp(fc) { var r = papx ? runAt(papx, fc) : null; return !!(r && r.ttp); }   // is this 0x07 the row terminator? (plain-text path)
+    function paraIsTtp(fc) { var r = resolvedPap(fc); return !!(r && r.ttp); }   // is this 0x07 the row terminator? (plain-text path)
     // One PAPX lookup for a row-terminator 0x07: whether it ends the row (sprmPFTtp) plus
     // that row's column boundaries (rgdxaCenter twips) / per-cell shading / merge flags;
     // null off the table path. Folds what used to be four separate runAt() searches into one.
-    function paraRow(fc) { var r = papx ? runAt(papx, fc) : null; return r ? { ttp: !!r.ttp, tblw: r.tblw || null, tblShd: r.tblShd || null, tblMerge: r.tblMerge || null } : null; }
+    function paraRow(fc) { var r = resolvedPap(fc); return r ? { ttp: !!r.ttp, tblw: r.tblw || null, tblShd: r.tblShd || null, tblMerge: r.tblMerge || null } : null; }
     for (var bi = 0; bi < bounds.length; bi++) {
       var nm = bounds[bi][0], a = bounds[bi][1], b = bounds[bi][2];
       doc[nm] = extractRange(wd, pieces, a, b, isDeleted, paraIsTtp, paraList, listDefs);
@@ -475,9 +540,20 @@
       var hK = pick([7, 10, 6]), fK = pick([9, 11, 8]);   // header: odd/first/even; footer: odd/first/even
       if (hK >= 0) doc.model.header = grab(hK);
       if (fK >= 0) doc.model.footer = grab(fK);
+      var headerSlots = [[6, 'even'], [7, 'default'], [10, 'first']];
+      var footerSlots = [[8, 'even'], [9, 'default'], [11, 'first']];
+      doc.model.headerVariants = []; doc.model.footerVariants = [];
+      for (var hs = 0; hs < headerSlots.length; hs++) {
+        var hk = headerSlots[hs][0];
+        if (hk + 1 < hdd.length && hdd[hk + 1] > hdd[hk]) doc.model.headerVariants.push({ variant: headerSlots[hs][1], paragraphs: grab(hk) });
+      }
+      for (var fs = 0; fs < footerSlots.length; fs++) {
+        var fk = footerSlots[fs][0];
+        if (fk + 1 < hdd.length && hdd[fk + 1] > hdd[fk]) doc.model.footerVariants.push({ variant: footerSlots[fs][1], paragraphs: grab(fk) });
+      }
     }
     // Page setup: the first section's properties (margins, page size, orientation).
-    var sections = parseSections(tableBytes, fibRgFcLcbStart, dv, wd);
+    var sections = parseSections(tableBytes, fibRgFcLcbStart, dv, wd, diagnostics);
     if (sections) {
       var sx = sections.filter(function (s) { return s; });
       if (sx.length) doc.model.sections = sx;   // every section's setup
@@ -492,6 +568,7 @@
     // Standard bookmarks (named CP ranges) as model.bookmarks = [{ name, start, end }].
     var bookmarks = parseBookmarks(tableBytes, fibRgFcLcbStart, dv);
     if (bookmarks) doc.model.bookmarks = bookmarks;
+    doc.model.diagnostics = finishDiagnostics();
     return doc;
   }
 
@@ -551,7 +628,7 @@
   // PlcfBteChpx (FibRgFcLcb97 #12). parseChpx returns the runs in WordDocument
   // byte order, each with the direct character properties we use: the tracked-
   // deletion flag plus bold/italic/strike/underline/size/color/font/char-style.
-  function parseChpx(wd, table, fibRgFcLcbStart, fibDv) {
+  function parseChpx(wd, table, fibRgFcLcbStart, fibDv, diagnostics) {
     try {
       var pair = fibRgFcLcbStart + 12 * 8;
       if (pair + 8 > wd.length) return null;
@@ -565,7 +642,7 @@
       var runs = [];
       for (var i = 0; i < n; i++) {
         var pn = tdv.getUint32(pnBase + i * 4, true) & 0x003FFFFF; // PnFkpChpx.pn
-        collectFkpRuns(wd, pn * 512, runs);
+        collectFkpRuns(wd, pn * 512, runs, diagnostics);
       }
       runs.sort(function (x, y) { return x.a - y.a; });
       return runs;
@@ -574,7 +651,7 @@
 
   // One ChpxFkp page (512 bytes at pn*512): crun at byte 511, rgfc[crun+1],
   // then rgb[crun] (word offsets to each Chpx; 0 = default props).
-  function collectFkpRuns(wd, pageOff, runs) {
+  function collectFkpRuns(wd, pageOff, runs, diagnostics) {
     if (pageOff < 0 || pageOff + 512 > wd.length) return;
     var dv = new DataView(wd.buffer, wd.byteOffset, wd.byteLength);
     var crun = wd[pageOff + 511];
@@ -590,7 +667,7 @@
         var chpxOff = pageOff + word * 2;             // Chpx: cb, then grpprl
         if (chpxOff >= pageOff && chpxOff < pageOff + 512) {
           var cb = wd[chpxOff];
-          if (chpxOff + 1 + cb <= pageOff + 512) props = parseChpGrpprl(wd, chpxOff + 1, cb);
+          if (chpxOff + 1 + cb <= pageOff + 512) props = parseChpGrpprl(wd, chpxOff + 1, cb, diagnostics);
         }
       }
       runs.push({ a: a, b: b, p: props });
@@ -601,12 +678,39 @@
   // empirically against real documents. ToggleOperand props (bold/italic/...)
   // are "on" exactly when bit 0 of the operand is set (covers 0x01 and 0x81 —
   // 0x81 = "invert the off style default" = on; the same rule as deletions).
-  function parseChpGrpprl(wd, off, len) {
+  var CHP_SPRMS = { 0x0800: 1, 0x0801: 1, 0x0835: 1, 0x0836: 1, 0x0837: 1,
+    0x083A: 1, 0x083B: 1, 0x083C: 1, 0x2A3E: 1, 0x2A48: 1, 0x2A53: 1,
+    0x8840: 1, 0x4845: 1, 0x2A0C: 1, 0x4A43: 1, 0x2A42: 1, 0x6870: 1,
+    0x4A4F: 1, 0x4A30: 1, 0x6A03: 1, 0x0855: 1, 0x4A50: 1,
+    0x4A51: 1, 0x4A5E: 1, 0x4A61: 1, 0x085C: 1, 0x085D: 1,
+    0x486D: 1, 0x4873: 1, 0x486E: 1, 0x4874: 1, 0x485F: 1,
+    0x484B: 1, 0x085A: 1, 0x0875: 1, 0x6815: 1, 0x6816: 1,
+    0x286F: 1, 0x4888: 1, 0x6887: 1 };
+  function createDiagnostics() {
+    return { character: {}, paragraph: {}, section: {}, trackedChanges: 0 };
+  }
+  function mergeDiagnostics(target, source) {
+    if (!target || !source) return;
+    var groups = ['character', 'paragraph', 'section'];
+    for (var i = 0; i < groups.length; i++) {
+      var group = groups[i], values = source[group] || {};
+      for (var code in values) target[group][code] = (target[group][code] || 0) + values[code];
+    }
+    target.trackedChanges += source.trackedChanges || 0;
+  }
+  function noteUnsupported(diagnostics, group, sprm) {
+    if (!diagnostics) return;
+    var code = '0x' + ('0000' + sprm.toString(16)).slice(-4);
+    diagnostics[group][code] = (diagnostics[group][code] || 0) + 1;
+  }
+  function parseChpGrpprl(wd, off, len, diagnostics) {
     var p = {}, q = off, end = off + len;
     while (q + 2 <= end) {
       var sprm = wd[q] | (wd[q + 1] << 8); q += 2;
+      if (!CHP_SPRMS[sprm]) noteUnsupported(diagnostics, 'character', sprm);
       switch (sprm) {
-        case 0x0800: p.del = (wd[q] & 1) === 1; break;        // sprmCFRMarkDel (deletion)
+        case 0x0800: p.del = (wd[q] & 1) === 1; if (p.del && diagnostics) diagnostics.trackedChanges++; break; // sprmCFRMarkDel
+        case 0x0801: if ((wd[q] & 1) === 1 && diagnostics) diagnostics.trackedChanges++; break; // sprmCFRMarkIns
         case 0x0835: p.b = (wd[q] & 1) === 1; break;          // bold
         case 0x0836: p.i = (wd[q] & 1) === 1; break;          // italic
         case 0x0837: p.strike = (wd[q] & 1) === 1; break;     // strikethrough
@@ -622,7 +726,23 @@
         case 0x4A43: p.hps = wd[q] | (wd[q + 1] << 8); break;  // font size, half-points
         case 0x2A42: p.ico = wd[q]; break;                     // color, 16-colour palette index
         case 0x6870: p.cv = (wd[q] | (wd[q + 1] << 8) | (wd[q + 2] << 16)) >>> 0; break; // 24-bit RGB
-        case 0x4A4F: p.ftc = wd[q] | (wd[q + 1] << 8); break;  // font index (ftc0) -> SttbfFfn
+        case 0x4A4F: p.ftc = wd[q] | (wd[q + 1] << 8); break;  // ASCII font index (ftc0) -> SttbfFfn
+        case 0x4A50: p.ftc1 = wd[q] | (wd[q + 1] << 8); break; // Far East font index
+        case 0x4A51: p.ftc2 = wd[q] | (wd[q + 1] << 8); break; // non-Far East font index
+        case 0x4A5E: p.ftcBi = wd[q] | (wd[q + 1] << 8); break; // complex-script font index
+        case 0x4A61: p.hpsBi = wd[q] | (wd[q + 1] << 8); break; // complex-script size, half-points
+        case 0x085C: p.bBi = (wd[q] & 1) === 1; break;          // complex-script bold
+        case 0x085D: p.iBi = (wd[q] & 1) === 1; break;          // complex-script italic
+        case 0x486D: case 0x4873: p.lid = wd[q] | (wd[q + 1] << 8); break;
+        case 0x486E: case 0x4874: p.lidEastAsia = wd[q] | (wd[q + 1] << 8); break;
+        case 0x485F: p.lidBi = wd[q] | (wd[q + 1] << 8); break;
+        case 0x484B: p.hpsKern = wd[q] | (wd[q + 1] << 8); break;
+        case 0x085A: p.bidi = (wd[q] & 1) === 1; break;
+        case 0x0875: p.noProof = (wd[q] & 1) === 1; break;
+        case 0x286F: p.idctHint = wd[q]; break;                 // font-slot hint for ambiguous marker text
+        case 0x4888: p.pbiGrf = wd[q] | (wd[q + 1] << 8); break; // picture-bullet flags
+        case 0x6887: p.pbiIndex = (wd[q] | (wd[q + 1] << 8) | (wd[q + 2] << 16) | (wd[q + 3] << 24)) >>> 0; break;
+        case 0x6815: case 0x6816: break;                       // revision-session IDs do not alter display
         case 0x4A30: p.istd = wd[q] | (wd[q + 1] << 8); break; // character style index
         case 0x6A03: p.picLoc = (wd[q] | (wd[q + 1] << 8) | (wd[q + 2] << 16) | (wd[q + 3] << 24)) >>> 0; break; // sprmCPicLocation (Data offset)
         case 0x0855: p.fSpec = wd[q] & 1; break;               // sprmCFSpec (special char, e.g. picture)
@@ -727,15 +847,15 @@
         var nameAt = std + cbBase, cch = dv.getUint16(nameAt, true);
         var up = nameAt + 2 + cch * 2 + 2;                // past style name + chTerm
         var chpIdx = stk === 1 ? 1 : 0;                   // para style: PAP is 1st UPX, CHP is 2nd
-        var chp = {}, pap = {};
+        var chp = {}, pap = {}, styleDiagnostics = createDiagnostics();
         for (var u = 0; u < cupx && up + 2 <= std + cbStd; u++) {
           var cbUpx = dv.getUint16(up, true); up += 2;
-          if (u === chpIdx) chp = parseChpGrpprl(table, up, cbUpx);
+          if (u === chpIdx) chp = parseChpGrpprl(table, up, cbUpx, styleDiagnostics);
           // A paragraph style's first UPX is a UpxPapx: a 2-byte istd then grpprlPapx.
-          else if (u === 0 && stk === 1 && cbUpx >= 2) pap = parsePapGrpprl(table, dv, up + 2, up + cbUpx, up + cbUpx);
+          else if (u === 0 && stk === 1 && cbUpx >= 2) pap = parsePapGrpprl(table, dv, up + 2, up + cbUpx, up + cbUpx, styleDiagnostics);
           up += cbUpx; if (up & 1) up++;                  // UPXs are padded to even
         }
-        raw[i] = { base: istdBase, chp: chp, pap: pap };
+        raw[i] = { base: istdBase, chp: chp, pap: pap, diagnostics: styleDiagnostics };
       }
       // Pass 2: resolve inheritance for each property set (parent props, then
       // own props) up the istdBase chain — the same layering for CHP and PAP.
@@ -749,7 +869,12 @@
         return (out[i] = r);
       }
       for (var j = 0; j < cstd; j++) { resolve('chp', outChp, j, 0); resolve('pap', outPap, j, 0); }
-      return { chp: outChp, pap: outPap };
+      return {
+        chp: outChp,
+        pap: outPap,
+        bases: raw.map(function (style) { return style ? style.base : 0x0FFF; }),
+        diagnostics: raw.map(function (style) { return style ? style.diagnostics : null; })
+      };
     } catch (e) { return null; }
   }
 
@@ -757,7 +882,7 @@
   // index (istd) for each WordDocument byte range, so a run inherits its
   // paragraph style's character formatting (e.g. a heading's bold). We only
   // need each paragraph's istd. [MS-DOC] PlcfBtePapx / PapxFkp / PapxInFkp.
-  function parsePapx(wd, table, fibStart, fibDv) {
+  function parsePapx(wd, table, fibStart, fibDv, diagnostics) {
     try {
       var fc = fibDv.getUint32(fibStart + 13 * 8, true);
       var lcb = fibDv.getUint32(fibStart + 13 * 8 + 4, true);
@@ -768,7 +893,7 @@
       var pnBase = fc + (n + 1) * 4, runs = [];
       for (var i = 0; i < n; i++) {
         var pn = tdv.getUint32(pnBase + i * 4, true) & 0x003FFFFF;
-        collectPapxFkp(wd, pn * 512, runs);
+        collectPapxFkp(wd, pn * 512, runs, diagnostics);
       }
       runs.sort(function (x, y) { return x.a - y.a; });
       return runs;
@@ -786,17 +911,38 @@
   // than resetting). The same grpprl format appears in a PapxInFkp and in a
   // style's UpxPapx, so both callers share this. `dv` is a DataView over `buf`
   // (for signed reads); `cap` is the hard ceiling for variable-length reads.
-  function parsePapGrpprl(buf, dv, gStart, grpEnd, cap) {
+  function supportedPapSprm(sprm) {
+    return sprm === 0x2403 || sprm === 0x2461 || sprm === 0x460B || sprm === 0x260A
+      || sprm === 0x2405 || sprm === 0x2406 || sprm === 0x2407 || sprm === 0x2416
+      || sprm === 0x2417 || sprm === 0xC60D || sprm === 0xC615 || sprm === 0x840F
+      || sprm === 0x840E || sprm === 0x8411 || sprm === 0xA413 || sprm === 0xA414
+      || sprm === 0x6412 || sprm === 0xD608 || sprm === 0xD612 || sprm === 0xC64D
+      || sprm === 0x442D || sprm >= 0xC64E && sprm <= 0xC651
+      || sprm >= 0x6424 && sprm <= 0x6427 || sprm === 0x845D
+      || sprm === 0x845E || sprm === 0x8460 || sprm === 0x6649
+      || sprm === 0x6467 || sprm === 0x6465 || sprm === 0x7469 || sprm === 0x7479
+      || sprm === 0x240C || sprm === 0x242A || sprm === 0x2431 || sprm === 0x2441
+      || sprm === 0x246D || sprm === 0x2640;
+  }
+  function parsePapGrpprl(buf, dv, gStart, grpEnd, cap, diagnostics) {
     var pp = {};
     function cv24(o) { return buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16); }  // 24-bit COLORREF (Shd/Brc fill) at byte offset o
     for (var gp = gStart; gp + 2 <= grpEnd;) {
       var sc = buf[gp] | (buf[gp + 1] << 8), ol = sprmOperandLen(sc, buf, gp + 2);
+      if (!supportedPapSprm(sc)) noteUnsupported(diagnostics, 'paragraph', sc);
       if (sc === 0x2403 || sc === 0x2461) pp.jc = buf[gp + 2];          // sprmPJc80 / sprmPJc
       else if (sc === 0x460B) pp.ilfo = buf[gp + 2] | (buf[gp + 3] << 8); // sprmPIlfo (list)
       else if (sc === 0x260A) pp.ilvl = buf[gp + 2];                     // sprmPIlvl (level)
       else if (sc === 0x2405) pp.keepL = buf[gp + 2];                    // sprmPFKeep (keep lines together)
       else if (sc === 0x2406) pp.keepN = buf[gp + 2];                    // sprmPFKeepFollow (keep with next)
       else if (sc === 0x2407) pp.pgBrk = buf[gp + 2];                    // sprmPFPageBreakBefore
+      else if (sc === 0x240C) pp.suppressLineNumbers = buf[gp + 2];
+      else if (sc === 0x242A) pp.noAutoHyph = buf[gp + 2];
+      else if (sc === 0x2431) pp.widow = buf[gp + 2];
+      else if (sc === 0x2441) pp.bidi = buf[gp + 2];
+      else if (sc === 0x246D) pp.contextual = buf[gp + 2];
+      else if (sc === 0x2640) pp.outlineLevel = buf[gp + 2];
+      else if (sc === 0x2416) pp.inTable = buf[gp + 2];                 // sprmPFInTable
       else if (sc === 0x2417) pp.ttp = buf[gp + 2];                      // sprmPFTtp (table-terminating paragraph = row mark)
       else if (sc === 0xC60D || sc === 0xC615) {                         // sprmPChgTabsPapx / sprmPChgTabs: custom tab stops
         var tcb = buf[gp + 2], end2 = gp + 3 + tcb, p2 = gp + 3;         // operand: cb, then PChgTabsDel[Close], then PChgTabsAdd
@@ -815,9 +961,11 @@
           }
         }
       }
-      else if (sc === 0x840F) pp.indL = dv.getInt16(gp + 2, true);      // sprmPDxaLeft
-      else if (sc === 0x840E) pp.indR = dv.getInt16(gp + 2, true);      // sprmPDxaRight
-      else if (sc === 0x8411) pp.ind1 = dv.getInt16(gp + 2, true);      // sprmPDxaLeft1 (first line; <0 = hanging)
+      else if (sc === 0x840F || sc === 0x845E) pp.indL = dv.getInt16(gp + 2, true); // sprmPDxaLeft / sprmPDxaLeft80
+      else if (sc === 0x840E || sc === 0x845D) pp.indR = dv.getInt16(gp + 2, true); // sprmPDxaRight / sprmPDxaRight80
+      else if (sc === 0x8411 || sc === 0x8460) pp.ind1 = dv.getInt16(gp + 2, true); // sprmPDxaLeft1 / sprmPDxaLeft180
+      else if (sc === 0x6649) pp.itap = dv.getUint32(gp + 2, true);      // table nesting depth
+      else if (sc === 0x6467 || sc === 0x6465 || sc === 0x7469 || sc === 0x7479) { } // revision/paragraph IDs do not alter display
       else if (sc === 0xA413) pp.spB = dv.getInt16(gp + 2, true);       // sprmPDyaBefore
       else if (sc === 0xA414) pp.spA = dv.getInt16(gp + 2, true);       // sprmPDyaAfter
       else if (sc === 0x6412) { pp.line = dv.getInt16(gp + 2, true); pp.lineMult = buf[gp + 4] | (buf[gp + 5] << 8); } // sprmPDyaLine (LSPD)
@@ -870,7 +1018,7 @@
   // 13 bytes each; first byte is the word offset to a PapxInFkp, 0 = default).
   // Each run carries the paragraph's istd plus the sparse PAP props from its
   // grpprl (parsePapGrpprl); absent props are inherited from the istd's style.
-  function collectPapxFkp(wd, pageOff, runs) {
+  function collectPapxFkp(wd, pageOff, runs, diagnostics) {
     if (pageOff < 0 || pageOff + 512 > wd.length) return;
     var dv = new DataView(wd.buffer, wd.byteOffset, wd.byteLength);
     var crun = wd[pageOff + 511];
@@ -889,7 +1037,7 @@
           if (g + 2 <= pageOff + 512) istd = wd[g] | (wd[g + 1] << 8);
           var grpEnd = cb !== 0 ? papx + 2 * cb : papx + 2 + 2 * (wd[papx + 1] || 0);
           if (grpEnd > pageOff + 512) grpEnd = pageOff + 512;
-          pp = parsePapGrpprl(wd, dv, g + 2, grpEnd, pageOff + 512);  // grpprl follows the 2-byte istd
+          pp = parsePapGrpprl(wd, dv, g + 2, grpEnd, pageOff + 512, diagnostics);  // grpprl follows the 2-byte istd
         }
       }
       var run = { a: a, b: b, istd: istd };
@@ -1022,11 +1170,16 @@
   // (sprmSDyaTop 0x9023 / sprmSDyaBottom 0x9024 signed; sprmSDxaLeft 0xB021 /
   // sprmSDxaRight 0xB022), page size (sprmSXaPage 0xB01F / sprmSYaPage 0xB020),
   // orientation (sprmSBOrientation 0x301D), columns (sprmSCcolumns 0x500B). Twips.
-  function sepxProps(wdv, wd, fcSepx) {
+  var SEPX_SPRMS = { 0x9023: 1, 0x9024: 1, 0xB021: 1, 0xB022: 1,
+    0xB01F: 1, 0xB020: 1, 0x301D: 1, 0x500B: 1, 0xB025: 1,
+    0xB017: 1, 0xB018: 1, 0x900C: 1, 0x9031: 1, 0x703A: 1, 0x5026: 1,
+    0x300A: 1, 0x3228: 1, 0x5033: 1 };
+  function sepxProps(wdv, wd, fcSepx, diagnostics) {
     if (fcSepx === 0xFFFFFFFF || fcSepx + 2 > wd.length) return null;
     var cb = wdv.getUint16(fcSepx, true), g = fcSepx + 2, end = fcSepx + 2 + cb, p = {};
     while (g + 2 <= end && g + 4 <= wd.length) {
       var sprm = wdv.getUint16(g, true), spra = (sprm >> 13) & 7;
+      if (!SEPX_SPRMS[sprm]) noteUnsupported(diagnostics, 'section', sprm);
       var opLen = spra <= 1 ? 1 : (spra === 2 || spra === 4 || spra === 5) ? 2 : spra === 3 ? 4 : spra === 7 ? 3 : (1 + (wd[g + 2] || 0));
       if (sprm === 0x9023) p.top = wdv.getInt16(g + 2, true);
       else if (sprm === 0x9024) p.bottom = wdv.getInt16(g + 2, true);
@@ -1036,6 +1189,15 @@
       else if (sprm === 0xB020) p.height = wdv.getUint16(g + 2, true);
       else if (sprm === 0x301D) p.landscape = wd[g + 2] === 2;
       else if (sprm === 0x500B) p.cols = wdv.getUint16(g + 2, true) + 1;  // sprmSCcolumns (ccolM1)
+      else if (sprm === 0xB025) p.gutter = wdv.getUint16(g + 2, true);
+      else if (sprm === 0xB017) p.header = wdv.getUint16(g + 2, true);
+      else if (sprm === 0xB018) p.footer = wdv.getUint16(g + 2, true);
+      else if (sprm === 0x900C) p.columnSpace = wdv.getInt16(g + 2, true);
+      else if (sprm === 0x9031) p.linePitch = wdv.getInt16(g + 2, true);
+      else if (sprm === 0x300A) p.titlePage = wd[g + 2] !== 0;
+      else if (sprm === 0x3228) p.bidi = wd[g + 2] !== 0;
+      else if (sprm === 0x5033) p.textFlow = wdv.getUint16(g + 2, true);
+      else if (sprm === 0x703A || sprm === 0x5026) { } // revision ID and printer paper request do not alter declared page geometry
       g += 2 + opLen; if (opLen <= 0) break;
     }
     return Object.keys(p).length ? p : null;
@@ -1043,7 +1205,7 @@
   // Every section's page setup (PlcfSed #6: (n+1) CPs then n 12-byte SEDs, each
   // SED.fcSepx -> a SEPX in the WordDocument). One entry per section (null for an
   // unreadable one); a single-section document gives a 1-element array.
-  function parseSections(table, fibStart, fibDv, wd) {
+  function parseSections(table, fibStart, fibDv, wd, diagnostics) {
     try {
       var sedFc = fibDv.getUint32(fibStart + 6 * 8, true), sedLcb = fibDv.getUint32(fibStart + 6 * 8 + 4, true);
       if (sedLcb < 16) return null;
@@ -1051,7 +1213,7 @@
       if (n < 1) return null;
       var tdv = new DataView(table.buffer, table.byteOffset, table.byteLength);
       var wdv = new DataView(wd.buffer, wd.byteOffset, wd.byteLength), base = sedFc + (n + 1) * 4, out = [];
-      for (var si = 0; si < n; si++) out.push(sepxProps(wdv, wd, tdv.getUint32(base + si * 12 + 2, true)));
+      for (var si = 0; si < n; si++) out.push(sepxProps(wdv, wd, tdv.getUint32(base + si * 12 + 2, true), diagnostics));
       return out;
     } catch (e) { return null; }
   }
@@ -1079,12 +1241,30 @@
     if (nfc === 4) return letterNum(n, false);
     return String(n);              // decimal and every non-bullet fallback
   }
-  function bulletGlyph(tmpl) {     // the bullet level's template is the glyph char
+  function bulletGlyph(tmpl, markerStyle) {
     var c = (tmpl && tmpl.length) ? tmpl[0] : 0x2022;
-    if (c === 0x6F || c === 0xF06F) return 'o';                  // hollow / 'o' bullet
-    if (c === 0xA7 || c === 0xF0A7 || c === 0xF0A8) return '▪'; // small square
-    if (c === 0x2D || c === 0x2013 || c === 0x2014) return '–'; // dash
-    return '•';               // round bullet — the common Word/Wingdings default
+    var family = markerStyle && markerStyle.font ? markerStyle.font.toLowerCase().replace(/[ -]/g, '') : '';
+    var low = c >= 0xF000 && c <= 0xF0FF ? c - 0xF000 : c;
+    if (family === 'symbol') {
+      if (low === 0xB7) return '•';
+      if (low === 0xA7) return '♣';
+      if (low === 0xA8) return '♦';
+    }
+    if (family === 'wingdings') {
+      if (low === 0x6F) return '□';
+      if (low === 0x76) return '❖';
+      if (low === 0xA7) return '▪';
+      if (low === 0xD8) return '➢';
+      if (low === 0xE8) return '➔';
+      if (low === 0xFB) return '✖';
+      if (low === 0xFC) return '✔';
+      if (low === 0xFD) return '☒';
+      if (low === 0xFE) return '☑';
+    }
+    if (low === 0x6F) return 'o';
+    if (c === 0xA7 || c === 0xF0A7) return '▪';
+    if (c === 0x2D || c === 0x2013 || c === 0x2014) return '–';
+    return '•';
   }
   // Stateful counter: mark(ilfo, ilvl) returns the next marker at that level and
   // advances the counters, restarting deeper levels (so 1, 1.1, 1.2, 2, 2.1 …).
@@ -1100,7 +1280,7 @@
       else { st.counters[ilvl] = startOf(d); st.started[ilvl] = true; }
       for (var k = ilvl + 1; k < 9; k++) st.started[k] = false;   // deeper levels restart on next use
       if (!d || d.nfc === 0xFF) return '';                        // msonfcNone
-      if (d.nfc === 23) return bulletGlyph(d.tmpl);               // bullet
+      if (d.nfc === 23) return bulletGlyph(d.tmpl, d.markerStyle); // bullet
       var out = '';
       for (var ci = 0; ci < d.tmpl.length; ci++) {
         var ch = d.tmpl[ci];
@@ -1115,7 +1295,7 @@
   // Read PlfLst + PlfLfo into { kind: {ilfo->'number'|'bullet'}, defs: {ilfo->[
   // {nfc, startAt, tmpl}]} }. tmpl is the LVL number text (placeholder chars 0..8
   // reference a level's number; everything else is literal). Best-effort -> null.
-  function parseListDefs(table, fibStart, fibDv) {
+  function parseListDefs(table, fibStart, fibDv, fonts, diagnostics) {
     try {
       var lstFc = fibDv.getUint32(fibStart + 73 * 8, true), lstLcb = fibDv.getUint32(fibStart + 73 * 8 + 4, true);
       var lfoFc = fibDv.getUint32(fibStart + 74 * 8, true), lfoLcb = fibDv.getUint32(fibStart + 74 * 8 + 4, true);
@@ -1128,10 +1308,33 @@
         var nLvl = lsts[i].simple ? 1 : 9, levels = [];
         for (var lv = 0; lv < nLvl && p + 28 <= table.length; lv++) {   // LVLs follow rgLstf contiguously, often past lcbPlcfLst
           var startAt = dv.getInt32(p, true), nfc = table[p + 4];
-          var cchOff = p + 28 + table[p + 24] + table[p + 25];   // skip LVLF(28) + grpprlChpx + grpprlPapx
+          var chpxLength = table[p + 24], papxLength = table[p + 25];
+          var papxOffset = p + 28, chpxOffset = papxOffset + papxLength;
+          var paragraphStyle = papxLength ? parsePapGrpprl(table, dv, papxOffset, chpxOffset, chpxOffset, diagnostics) : null;
+          var chpx = chpxLength ? parseChpGrpprl(table, chpxOffset, chpxLength, diagnostics) : null;
+          var markerStyle = null;
+          if (chpx && (chpx.pbiGrf & 1)) {
+            noteUnsupported(diagnostics, 'character', 0x4888);
+            noteUnsupported(diagnostics, 'character', 0x6887);
+          }
+          if (chpx) {
+            markerStyle = {};
+            if (fonts && chpx.ftc != null && fonts[chpx.ftc]) markerStyle.font = fonts[chpx.ftc];
+            if (fonts && chpx.ftc1 != null && fonts[chpx.ftc1]) markerStyle.fontEastAsia = fonts[chpx.ftc1];
+            if (fonts && chpx.ftc2 != null && fonts[chpx.ftc2]) markerStyle.fontHighAnsi = fonts[chpx.ftc2];
+            if (fonts && chpx.ftcBi != null && fonts[chpx.ftcBi]) markerStyle.fontComplexScript = fonts[chpx.ftcBi];
+            if (chpx.hps != null) markerStyle.size = chpx.hps / 2;
+            if (chpx.b != null) markerStyle.b = !!chpx.b;
+            if (chpx.i != null) markerStyle.i = !!chpx.i;
+            var markerColor = chpx.cv;
+            if ((markerColor == null || (markerColor & 0xFFFFFF) === 0) && chpx.ico >= 2 && chpx.ico <= 16 && ICO_CV[chpx.ico]) markerColor = ICO_CV[chpx.ico];
+            if (markerColor != null && (markerColor & 0xFFFFFF) !== 0) markerStyle.color = markerColor;
+            if (!Object.keys(markerStyle).length) markerStyle = null;
+          }
+          var cchOff = p + 28 + chpxLength + papxLength;   // skip LVLF(28) + grpprlChpx + grpprlPapx
           var cch = (cchOff + 2 <= table.length) ? dv.getUint16(cchOff, true) : 0, tmpl = [];
           for (var t = 0; t < cch && cchOff + 4 + t * 2 <= table.length; t++) tmpl.push(dv.getUint16(cchOff + 2 + t * 2, true));
-          levels.push({ nfc: nfc, startAt: startAt, tmpl: tmpl });
+          levels.push({ nfc: nfc, startAt: startAt, tmpl: tmpl, markerStyle: markerStyle, paragraphStyle: paragraphStyle });
           p = cchOff + 2 + cch * 2;
         }
         defsByLsid[lsts[i].lsid] = levels;
@@ -1324,9 +1527,9 @@
       if (p.cv != null && (p.cv & 0xFFFFFF) !== 0) color = p.cv & 0xFFFFFF; // already 0x00BBGGRR
       var va = p.iss === 1 ? 'super' : p.iss === 2 ? 'sub' : null;          // sprmCSs
       var hl = icoCv(p.highlightIco); // sprmCHighlight ico -> COLORREF
-      return { b: !!p.b, i: !!p.i, u: !!p.u, strike: !!p.strike, size: p.hps ? p.hps / 2 : null, font: p.font || null, color: color, va: va, highlight: hl, uStyle: (p.u && UL_STYLE[p.u]) || null, smallCaps: !!p.smallCaps, caps: !!p.caps, hidden: !!p.hidden, dstrike: !!p.dstrike, spacing: p.dxaSpace ? p.dxaSpace / 20 : null, position: p.hpsPos ? p.hpsPos / 2 : null };
+      return { b: !!p.b, i: !!p.i, u: !!p.u, strike: !!p.strike, size: p.hps ? p.hps / 2 : null, font: p.font || null, fontHighAnsi: p.fontHighAnsi || null, fontEastAsia: p.fontEastAsia || null, fontComplexScript: p.fontComplexScript || null, color: color, va: va, highlight: hl, uStyle: (p.u && UL_STYLE[p.u]) || null, smallCaps: !!p.smallCaps, caps: !!p.caps, hidden: !!p.hidden, dstrike: !!p.dstrike, spacing: p.dxaSpace ? p.dxaSpace / 20 : null, position: p.hpsPos ? p.hpsPos / 2 : null, language: p.lid || null, languageEastAsia: p.lidEastAsia || null, languageComplexScript: p.lidBi || null, sizeComplexScript: p.hpsBi ? p.hpsBi / 2 : null, boldComplexScript: !!p.bBi, italicComplexScript: !!p.iBi, rightToLeft: !!p.bidi, kern: p.hpsKern ? p.hpsKern / 2 : null, noProof: !!p.noProof };
     }
-    function key(pp) { return pp.b + '|' + pp.i + '|' + pp.u + '|' + pp.strike + '|' + pp.size + '|' + pp.font + '|' + pp.color + '|' + pp.va + '|' + pp.highlight + '|' + pp.uStyle + '|' + pp.smallCaps + '|' + pp.caps + '|' + pp.hidden + '|' + pp.dstrike + '|' + pp.spacing + '|' + pp.position; }
+    function key(pp) { return pp.b + '|' + pp.i + '|' + pp.u + '|' + pp.strike + '|' + pp.size + '|' + pp.font + '|' + pp.fontHighAnsi + '|' + pp.fontEastAsia + '|' + pp.fontComplexScript + '|' + pp.color + '|' + pp.va + '|' + pp.highlight + '|' + pp.uStyle + '|' + pp.smallCaps + '|' + pp.caps + '|' + pp.hidden + '|' + pp.dstrike + '|' + pp.spacing + '|' + pp.position + '|' + pp.language + '|' + pp.languageEastAsia + '|' + pp.languageComplexScript + '|' + pp.sizeComplexScript + '|' + pp.boldComplexScript + '|' + pp.italicComplexScript + '|' + pp.rightToLeft + '|' + pp.kern + '|' + pp.noProof; }
     // A HYPERLINK field instruction is `HYPERLINK "addr" [switches]`; the address
     // is the first quoted token (or first bare token for an unquoted URL).
     function parseHyperlink(s) {
@@ -1334,7 +1537,7 @@
       var q = /"([^"]+)"/.exec(m[1]); if (q) return q[1];
       var t = /(\S+)/.exec(m[1]); return t ? t[1] : null;
     }
-    function flushRun() { if (buf) { var r = { text: buf, b: curProps.b, i: curProps.i, u: curProps.u, strike: curProps.strike, size: curProps.size, font: curProps.font, color: curProps.color }; if (curProps.va) r.va = curProps.va; if (curProps.highlight != null) r.highlight = curProps.highlight; if (curProps.uStyle) r.uStyle = curProps.uStyle; if (curProps.smallCaps) r.smallCaps = true; if (curProps.caps) r.caps = true; if (curProps.hidden) r.hidden = true; if (curProps.dstrike) r.dstrike = true; if (curProps.spacing != null) r.spacing = curProps.spacing; if (curProps.position != null) r.position = curProps.position; if (curUrl) r.url = curUrl; runs.push(r); buf = ''; } }
+    function flushRun() { if (buf) { var r = { text: buf, b: curProps.b, i: curProps.i, u: curProps.u, strike: curProps.strike, size: curProps.size, font: curProps.font, color: curProps.color }; if (curProps.fontHighAnsi) r.fontHighAnsi = curProps.fontHighAnsi; if (curProps.fontEastAsia) r.fontEastAsia = curProps.fontEastAsia; if (curProps.fontComplexScript) r.fontComplexScript = curProps.fontComplexScript; if (curProps.va) r.va = curProps.va; if (curProps.highlight != null) r.highlight = curProps.highlight; if (curProps.uStyle) r.uStyle = curProps.uStyle; if (curProps.smallCaps) r.smallCaps = true; if (curProps.caps) r.caps = true; if (curProps.hidden) r.hidden = true; if (curProps.dstrike) r.dstrike = true; if (curProps.spacing != null) r.spacing = curProps.spacing; if (curProps.position != null) r.position = curProps.position; if (curProps.language != null) r.language = curProps.language; if (curProps.languageEastAsia != null) r.languageEastAsia = curProps.languageEastAsia; if (curProps.languageComplexScript != null) r.languageComplexScript = curProps.languageComplexScript; if (curProps.sizeComplexScript != null) r.sizeComplexScript = curProps.sizeComplexScript; if (curProps.boldComplexScript) r.boldComplexScript = true; if (curProps.italicComplexScript) r.italicComplexScript = true; if (curProps.rightToLeft) r.rightToLeft = true; if (curProps.kern != null) r.kern = curProps.kern; if (curProps.noProof) r.noProof = true; if (curUrl) r.url = curUrl; runs.push(r); buf = ''; } }
     function endPara(kind, fc, tblw, tblShd, tblMerge) { flushRun(); var pp = (paraPP && fc != null) ? paraPP(fc) : null; var par = { runs: runs, kind: kind, align: (paraAlign && fc != null) ? paraAlign(fc) : 0, list: (paraList && fc != null) ? paraList(fc) : null }; if (kind === 'p' && par.list) par.list.marker = listNum(par.list.ilfo, par.list.ilvl); if (pp) par.pp = pp; if (tblw) par.tblw = tblw; if (tblShd) par.tblShd = tblShd; if (tblMerge) par.tblMerge = tblMerge; paras.push(par); runs = []; curKey = null; curProps = null; }
     // Each cell mark (0x07) closes one cell; the row's terminator mark (sprmPFTtp)
     // promotes that row's last cell to the rowEnd and attaches the column boundaries /
@@ -1353,7 +1556,7 @@
         }
         lastCellPara = null;
       } else {                                        // ordinary cell mark
-        endPara('cell', null);
+        endPara('cell', fc);
         lastCellPara = paras[paras.length - 1];
       }
     }

@@ -78,7 +78,7 @@ var sp = docToText.model(spaced).body;
 var spPP = (sp.filter(function (p) { return p.pp; })[0] || {}).pp;
 check('indent/spacing round-trip (left+first-line+before/after+line)',
   !!spPP && spPP.indL === 720 && spPP.ind1 === -360 && spPP.spB === 120 && spPP.spA === 240 && spPP.line === 360);
-check('unspaced paragraph carries no .pp', sp.some(function (p) { return p.runs[0] && p.runs[0].text === 'Plain.' && !p.pp; }));
+check('unspaced paragraph retains only the inherited no-auto-hyphen setting', sp.some(function (p) { return p.runs[0] && p.runs[0].text === 'Plain.' && p.pp && p.pp.noAutoHyphens === true && Object.keys(p.pp).length === 1; }));
 
 // 6) Hyperlinks: a run with a URL becomes a HYPERLINK field (begin/instruction/
 // separator/result/end, the marks flagged sprmCFSpec, plus a PlcfFldMom). It
@@ -297,7 +297,7 @@ var kbDoc = textToDoc([
 var kb = docToText.model(kbDoc).body;
 check('keep-with-next round-trips (sprmPFKeepFollow)', !!kb[0].pp && kb[0].pp.keepNext === 1 && !kb[0].pp.keepLines);
 check('keep-together + page-break-before round-trip', !!kb[1].pp && kb[1].pp.keepLines === 1 && kb[1].pp.pageBreak === 1);
-check('a plain paragraph carries no keep/break flags', kb[2].pp == null);
+check('a plain paragraph carries no keep/break flags', !!kb[2].pp && kb[2].pp.noAutoHyphens === true && Object.keys(kb[2].pp).length === 1);
 
 // 16b) Tab stops: custom paragraph tab stops (sprmPChgTabsPapx -> PChgTabsPapxOperand)
 // round-trip — position (twips), alignment (jc) and leader (tlc, from each TBD byte).
@@ -427,6 +427,14 @@ check('fmtNum upper roman', L.fmtNum(4, 1) === 'IV');
 check('fmtNum lower roman', L.fmtNum(9, 2) === 'ix');
 check('fmtNum upper letter', L.fmtNum(1, 3) === 'A' && L.fmtNum(27, 3) === 'AA');
 check('fmtNum lower letter', L.fmtNum(2, 4) === 'b');
+var symbols = L.makeNumberer({ 9: [
+  { nfc: 23, startAt: 1, tmpl: [0xF0B7], markerStyle: { font: 'Symbol' } },
+  { nfc: 23, startAt: 1, tmpl: [0xF0FC], markerStyle: { font: 'Wingdings' } },
+  { nfc: 23, startAt: 1, tmpl: [0xF076], markerStyle: { font: 'Wingdings' } },
+  { nfc: 23, startAt: 1, tmpl: [0xF0D8], markerStyle: { font: 'Wingdings' } },
+  { nfc: 23, startAt: 1, tmpl: [0xF0A8], markerStyle: { font: 'Symbol' } }
+] });
+check('symbol-font bullet semantics', [0, 1, 2, 3, 4].map(function (level) { return symbols(9, level); }).join('') === '•✔❖➢♦');
 // A two-level decimal list: level 0 = "N.", level 1 = "N.M".
 var num = L.makeNumberer({ 1: [{ nfc: 0, startAt: 1, tmpl: [0, 46] }, { nfc: 0, startAt: 1, tmpl: [0, 46, 1] }] });
 var seq = [[1, 0], [1, 0], [1, 1], [1, 1], [1, 0], [1, 1]].map(function (s) { return num(s[0], s[1]); });

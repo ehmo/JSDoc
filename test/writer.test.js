@@ -44,6 +44,20 @@ cases.forEach(function (input, i) {
   check('case ' + i + ' round-trips through docToText', got === want);
 });
 
+// CFB files with more than 109 FAT sectors need a DIFAT continuation sector.
+// This covers both the writer and its exposed template/tooling reader.
+var large = new Uint8Array(8 * 1024 * 1024);
+for (var lp = 0; lp < large.length; lp += 4093) large[lp] = lp / 4093 & 0xFF;
+var largeCfb = textToDoc.buildCfb([{ name: 'Large', data: large }]);
+var largeView = new DataView(largeCfb.buffer, largeCfb.byteOffset, largeCfb.byteLength);
+var largeRead = textToDoc.readCfb(largeCfb);
+check('large CFB uses more than 109 FAT sectors', largeView.getUint32(44, true) > 109);
+check('large CFB writes a DIFAT continuation sector', largeView.getUint32(72, true) === 1);
+check('large CFB reader follows DIFAT', !!largeRead && !!largeRead.byName.Large
+  && largeRead.byName.Large.length === large.length
+  && largeRead.byName.Large[0] === large[0]
+  && largeRead.byName.Large[4093 * 1024] === large[4093 * 1024]);
+
 // Independent oracle: word-extractor must also parse our .doc.
 (function () {
   var WordExtractor;
