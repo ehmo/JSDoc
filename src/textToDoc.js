@@ -54,6 +54,32 @@
   var _tpl = null;
   function defaultTemplate() { return _tpl || (_tpl = b64ToU8(TEMPLATE_B64)); }
 
+  // The bundled Word 2002 skeleton carries the 0x0101 FibBase and 136
+  // FibRgFcLcb pairs, but its zero-filled tail omits the required
+  // FibRgCswNew version words. Repair only that exact profile. A caller's
+  // unrelated custom template is left alone.
+  function repairWord2002Fib(wordDocument) {
+    var b = toU8(wordDocument);
+    if (b.length < 64) throw new Error('template has a truncated FIB');
+    var view = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    var nFib = view.getUint16(2, true), fcMin = view.getUint32(24, true);
+    var csw = view.getUint16(32, true), cslwAt = 34 + csw * 2;
+    if (cslwAt + 2 > b.length) throw new Error('template has a truncated FIB');
+    var cslw = view.getUint16(cslwAt, true);
+    var pairCountAt = cslwAt + 2 + cslw * 4;
+    if (pairCountAt + 2 > b.length) throw new Error('template has a truncated FIB');
+    var pairCount = view.getUint16(pairCountAt, true);
+    var cswNewAt = pairCountAt + 2 + pairCount * 8;
+    if (cswNewAt + 2 > b.length) throw new Error('template has a truncated FIB');
+    var cswNew = view.getUint16(cswNewAt, true);
+    if (nFib !== 0x0101 || csw !== 14 || cslw !== 22 || pairCount !== 0x0088 || cswNew !== 0) return;
+    if (cswNewAt + 6 > b.length || cswNewAt + 6 > fcMin)
+      throw new Error('template has no room for the Word 2002 FIB extension');
+    u16(b, cswNewAt, 2);
+    u16(b, cswNewAt + 2, 0x0101);
+    u16(b, cswNewAt + 4, 0);
+  }
+
   // ---- minimal [MS-CFB] reader: name -> stream bytes (root level) ----------
   function readCfb(bytes) {
     var b = toU8(bytes), dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
@@ -754,6 +780,7 @@
     var chpx = placePages(chpxRuns.map(function (r) { return { fc0: fcAt(r.s), fc1: fcAt(r.e), blob: r.blob }; }), 1);
     var papx = placePages(papxParas.map(function (p) { return { fc0: fcAt(p.s), fc1: fcAt(p.e), blob: p.blob }; }), 13);
     var newWd = concat(parts, totalLen);
+    repairWord2002Fib(newWd);
     // Keep FibBase text bounds consistent with the replacement text plane.
     // Strict readers use these before following the piece table.
     u32(newWd, 24, T);                              // fcMin

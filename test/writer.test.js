@@ -44,6 +44,25 @@ cases.forEach(function (input, i) {
   check('case ' + i + ' round-trips through docToText', got === want);
 });
 
+// The bundled template is a Word 2002 FIB. Its output must declare the
+// matching FibRgCswNew extension rather than relying on lenient readers.
+(function () {
+  var streams = textToDoc.readCfb(textToDoc('FIB profile check.'));
+  var wordDocument = streams && streams.byName.WordDocument;
+  var view = wordDocument && new DataView(wordDocument.buffer,
+    wordDocument.byteOffset, wordDocument.byteLength);
+  var csw = view && view.getUint16(32, true);
+  var cslwAt = 34 + csw * 2;
+  var cslw = view && view.getUint16(cslwAt, true);
+  var pairCountAt = cslwAt + 2 + cslw * 4;
+  var pairCount = view && view.getUint16(pairCountAt, true);
+  var cswNewAt = pairCountAt + 2 + pairCount * 8;
+  check('Word 2002 FIB has 136 FibRgFcLcb pairs', pairCount === 0x0088);
+  check('Word 2002 FIB declares two FibRgCswNew words', view.getUint16(cswNewAt, true) === 2);
+  check('Word 2002 FIB extension repeats nFib 0x0101', view.getUint16(cswNewAt + 2, true) === 0x0101);
+  check('Word 2002 FIB extension reserved word is zero', view.getUint16(cswNewAt + 4, true) === 0);
+})();
+
 // CFB files with more than 109 FAT sectors need a DIFAT continuation sector.
 // This covers both the writer and its exposed template/tooling reader.
 var large = new Uint8Array(8 * 1024 * 1024);
